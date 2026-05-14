@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -14,6 +15,17 @@ from typing import Any
 
 import numpy as np
 from scipy import stats
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from _df_common.pii_scrubber import PIIScrubber, scrub_audit_payload
+from _df_common.welle_b2_patches import (
+    K13PreActionVerifier,
+    K16MutexGuard,
+    MOCK_PREFIX,
+    make_mock_url,
+    make_provenance_envelope,
+)
 
 try:
     import structlog
@@ -130,6 +142,7 @@ class RhoForecastEngine:
         self.config = config
         self.breaker = CircuitBreaker(config.circuit_open_threshold)
         self.log = _logger()
+        self.pii_scrubber = PIIScrubber(enabled=True, kemmer_names_enabled=True)
 
     def mode(self) -> str:
         enabled = os.environ.get("DF_HLM_7_REAL_SALES_CLOUD_ENABLED", "").lower() == "true"
@@ -157,6 +170,7 @@ class RhoForecastEngine:
             return []
         if self.mode() == "mock":
             return self._synthetic_sales_data()
+        self._verify_real_dispatch()
         try:
             raw = os.environ.get("DF_HLM_7_SALES_CLOUD_REVENUE_JSON")
             if not raw:
@@ -177,12 +191,17 @@ class RhoForecastEngine:
         return rows
 
     def run(self, month: str | None = None) -> dict[str, Any]:
+        with K16MutexGuard(lock_dir="/tmp/df-hlm-7.lock", df_engine_marker="rho_forecast.py"):
+            return self._run_once(month)
+
+    def _run_once(self, month: str | None = None) -> dict[str, Any]:
         domain = self.pre_action_domain_check()
         sales = self.load_sales_cloud_revenue()
         mode = self._degradation_mode(sales)
         forecast = self.monte_carlo_forecast()
         sensitivity = self.sensitivity_analysis(forecast["samples"])
         top_sources = self.pareto_top_3_lift_sources(forecast["samples"])
+        timestamp = utc_now()
         payload = {
             "df_id": "DF-HLM-7",
             "month": month or datetime.now(timezone.utc).strftime("%Y-%m"),
@@ -194,14 +213,14 @@ class RhoForecastEngine:
             "forecast": {k: v for k, v in forecast.items() if k != "samples"},
             "sensitivity": sensitivity,
             "pareto_top_3_lift_sources": top_sources,
-            "provenance": self.provenance(),
-            "timestamp": utc_now(),
+            "provenance": self.provenance(timestamp),
+            "timestamp": timestamp,
         }
         snap = self.write_monthly_snapshot(payload)
         pdf = self.generate_quarterly_pdf(payload)
         payload["snapshot_path"] = str(snap)
         payload["pdf_path"] = str(pdf)
-        self.append_audit("run_complete", payload)
+        self.append_audit("mock_run_complete" if self.mode() == "mock" else "run_complete", payload)
         return payload
 
     def _degradation_mode(self, sales: list[SalesCloudRevenue]) -> str:
@@ -256,7 +275,20 @@ class RhoForecastEngine:
             scored.append({"source": name, "rho_per_token": round(impact / tokens, 9), "tokens": tokens})
         return sorted(scored, key=lambda item: item["rho_per_token"], reverse=True)[:3]
 
-    def provenance(self) -> dict[str, Any]:
+    def provenance(self, timestamp_iso: str) -> dict[str, Any]:
+        is_mock = self.mode() == "mock"
+        output_provenance = make_provenance_envelope(
+            df_id="DF-HLM-7",
+            timestamp_iso=timestamp_iso,
+            is_mock=is_mock,
+            activation_gate_id=None if is_mock else os.environ.get("PHRONESIS_TICKET"),
+        )
+        if is_mock:
+            output_provenance["artifact_url"] = make_mock_url(
+                "https://mock.df-hlm-7.local/artifacts",
+                sanitize_identifier(f"{payload_safe_fragment(timestamp_iso)}-{self.config.seed}"),
+            )
+            output_provenance["mock_prefix"] = MOCK_PREFIX
         return {
             "iteration_count": self.config.iterations,
             "seed": self.config.seed,
@@ -264,37 +296,62 @@ class RhoForecastEngine:
             "non_llm_validation_layer": True,
             "deterministic_with_fixed_seed": True,
             "constraints": K_CONSTRAINTS,
+            "output": output_provenance,
         }
 
     def write_monthly_snapshot(self, payload: dict[str, Any]) -> Path:
         self.config.state_dir.mkdir(parents=True, exist_ok=True)
         path = self.config.state_dir / f"{payload['month']}-seed-{self.config.seed}.json"
-        atomic_write_json(path, payload)
+        atomic_write_json(path, self.pii_scrubber.scrub_dict_recursive(payload))
         return path
 
     def generate_quarterly_pdf(self, payload: dict[str, Any]) -> Path:
         self.config.reports_dir.mkdir(parents=True, exist_ok=True)
         path = self.config.reports_dir / f"martin-quarterly-{payload['month']}.pdf"
+        safe_payload = self.pii_scrubber.scrub_dict_recursive(payload)
         if canvas is None or A4 is None:
-            path.write_bytes(b"%PDF-1.4\n% fallback report\n%%EOF\n")
+            atomic_write_bytes(path, b"%PDF-1.4\n% fallback report\n%%EOF\n")
             return path
-        chart = self._render_chart(payload)
-        c = canvas.Canvas(str(path), pagesize=A4)
+        chart = self._render_chart(safe_payload)
+        with tempfile.NamedTemporaryFile("wb", dir=str(path.parent), suffix=".pdf", delete=False) as handle:
+            tmp_path = Path(handle.name)
+        c = canvas.Canvas(str(tmp_path), pagesize=A4)
         width, height = A4
         c.setFont("Helvetica-Bold", 14)
-        c.drawString(2 * cm, height - 2 * cm, "DF-HLM-7 rho Forecast - Quartal-Bericht fuer Martin")
+        c.drawString(
+            2 * cm,
+            height - 2 * cm,
+            self.pii_scrubber.scrub("DF-HLM-7 rho Forecast - Quartal-Bericht fuer Martin"),
+        )
         c.setFont("Helvetica", 10)
-        c.drawString(2 * cm, height - 3 * cm, f"Month: {payload['month']} | Seed: {self.config.seed} | Iter: {self.config.iterations}")
-        c.drawString(2 * cm, height - 3.7 * cm, f"Mode: {payload['mode']} | Degradation: {payload['degradation_mode']}")
+        c.drawString(
+            2 * cm,
+            height - 3 * cm,
+            self.pii_scrubber.scrub(
+                f"Month: {safe_payload['month']} | Seed: {self.config.seed} | Iter: {self.config.iterations}"
+            ),
+        )
+        c.drawString(
+            2 * cm,
+            height - 3.7 * cm,
+            self.pii_scrubber.scrub(
+                f"Mode: {safe_payload['mode']} | Degradation: {safe_payload['degradation_mode']}"
+            ),
+        )
         y = height - 4.8 * cm
-        for month, values in payload["forecast"]["monthly"].items():
-            c.drawString(2 * cm, y, f"{month}: {values}")
+        for month, values in safe_payload["forecast"]["monthly"].items():
+            c.drawString(2 * cm, y, self.pii_scrubber.scrub(f"{month}: {values}"))
             y -= 0.6 * cm
-        c.drawString(2 * cm, y - 0.3 * cm, f"Largest driver: {payload['sensitivity']['largest_driver']}")
+        c.drawString(
+            2 * cm,
+            y - 0.3 * cm,
+            self.pii_scrubber.scrub(f"Largest driver: {safe_payload['sensitivity']['largest_driver']}"),
+        )
         if chart:
             c.drawImage(str(chart), 2 * cm, 3 * cm, width=15 * cm, height=7 * cm)
         c.showPage()
         c.save()
+        tmp_path.replace(path)
         return path
 
     def _render_chart(self, payload: dict[str, Any]) -> Path | None:
@@ -316,13 +373,25 @@ class RhoForecastEngine:
         return chart
 
     def append_audit(self, event: str, payload: dict[str, Any]) -> None:
-        entry = {"event": event, "timestamp": utc_now(), "month": payload.get("month"), "seed": self.config.seed}
+        entry = scrub_audit_payload(
+            {"event": event, "timestamp": utc_now(), "month": payload.get("month"), "seed": self.config.seed}
+        )
         self.config.audit_path.parent.mkdir(parents=True, exist_ok=True)
         with self.config.audit_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(entry, sort_keys=True) + "\n")
         if self.log is not None:
             log_entry = {k: v for k, v in entry.items() if k != "event"}
             self.log.info(event, **log_entry)
+
+    def _verify_real_dispatch(self) -> None:
+        verifier = K13PreActionVerifier(
+            expected_env_tag=os.environ.get("DF_EXPECTED_ENV_TAG", "dev"),
+            expected_mount_pattern="/Users/make",
+            blast_radius_class="state-only",
+        )
+        result = verifier.verify()
+        if not result.ok:
+            raise RuntimeError(f"K13-VETO: {result.failed_check}")
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -332,6 +401,22 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
         handle.write("\n")
         tmp = Path(handle.name)
     tmp.replace(path)
+
+
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", dir=str(path.parent), delete=False) as handle:
+        handle.write(payload)
+        tmp = Path(handle.name)
+    tmp.replace(path)
+
+
+def payload_safe_fragment(value: str) -> str:
+    return value.replace(":", "").replace("+", "-")
+
+
+def sanitize_identifier(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
 
 
 def utc_now() -> str:
