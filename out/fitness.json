@@ -1,0 +1,8 @@
+{
+  "df": "df-hlm-7-rho-forecast",
+  "ts": "2026-06-05T14:12:16.337742+00:00",
+  "ok": true,
+  "bytes": 3460,
+  "model": "qwen2.5:14b-instruct",
+  "duration_s": 67.6
+}
