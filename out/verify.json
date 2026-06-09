@@ -1,0 +1,12 @@
+{
+  "df": "df-hlm-7-rho-forecast",
+  "ts": "2026-06-08T19:55:17.654410+00:00",
+  "has_src": true,
+  "parse_ok": true,
+  "has_tests": true,
+  "test_ran": true,
+  "tests_passed": true,
+  "code_hash": "a365c67fa96c60cd",
+  "python": "3.14.4",
+  "crux": "[CRUX-MK]"
+}
