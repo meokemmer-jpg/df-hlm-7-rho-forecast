@@ -91,3 +91,4 @@ operations:
   audit_log_path: logs/df-hlm-7-audit.jsonl
   stop_flag_path: /tmp/df-hlm-7.stop
   health_file_path: /tmp/df-hlm-7-health.json
+crux-mk: true
