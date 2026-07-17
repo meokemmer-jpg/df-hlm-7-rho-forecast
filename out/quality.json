@@ -1,9 +1,9 @@
 {
   "df": "df-hlm-7-rho-forecast",
-  "ts": "2026-07-15T03:01:01.258719+00:00",
+  "ts": "2026-07-16T15:55:26.186509+00:00",
   "maturity": "TESTED",
   "maturity_level": 4,
   "evidence_grade": 4,
-  "wargame_verdict": null,
+  "wargame_verdict": "CONDITIONAL",
   "crux": "[CRUX-MK]"
 }
